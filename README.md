@@ -279,7 +279,7 @@ Number of reassembly buffers, i.e how many different incoming packets can be rea
 
 ### `DNS_MAX_RESULT_COUNT`
 
-Maximum amount of address results for a given DNS query that will be kept. For example, if this is set to 2 and the queried name has 4 `A` records, only the first 2 will be returned. Default: 1.
+Maximum amount of results for a given DNS query that will be kept. For example, if this is set to 2 and the queried name has 4 `A` records, only the first 2 will be returned. Default: 1.
 
 ### `DNS_MAX_SERVER_COUNT`
 

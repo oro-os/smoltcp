@@ -3,10 +3,41 @@ mod utils;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::Device;
 use smoltcp::phy::{Medium, wait as phy_wait};
-use smoltcp::socket::dns::{self, GetQueryResultError};
+use smoltcp::socket::dns::{self, GetQueryResultError, QueryResult};
 use smoltcp::time::Instant;
 use smoltcp::wire::{DnsQueryType, EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use std::os::unix::io::AsRawFd;
+
+fn parse_query_type(value: &str) -> DnsQueryType {
+    if value.eq_ignore_ascii_case("a") {
+        DnsQueryType::A
+    } else if value.eq_ignore_ascii_case("aaaa") {
+        DnsQueryType::Aaaa
+    } else {
+        #[cfg(feature = "proto-dns-srv")]
+        {
+            if value.eq_ignore_ascii_case("srv") {
+                return DnsQueryType::Srv;
+            }
+        }
+
+        panic!("unsupported DNS query type: {value}")
+    }
+}
+
+fn format_result(result: &QueryResult) -> String {
+    match result {
+        QueryResult::Address(addr) => format!("address={addr}"),
+        #[cfg(feature = "proto-dns-srv")]
+        QueryResult::Srv(srv) => format!(
+            "priority={} weight={} port={} target={}",
+            srv.priority,
+            srv.weight,
+            srv.port,
+            srv.target.as_str()
+        ),
+    }
+}
 
 fn main() {
     utils::setup_logging("warn");
@@ -14,6 +45,16 @@ fn main() {
     let (mut opts, mut free) = utils::create_options();
     utils::add_tuntap_options(&mut opts, &mut free);
     utils::add_middleware_options(&mut opts, &mut free);
+    opts.optopt(
+        "",
+        "type",
+        if cfg!(feature = "proto-dns-srv") {
+            "DNS query type (A, AAAA, SRV)"
+        } else {
+            "DNS query type (A, AAAA)"
+        },
+        "TYPE",
+    );
     free.push("ADDRESS");
 
     let mut matches = utils::parse_options(&opts, free);
@@ -22,6 +63,7 @@ fn main() {
     let mut device =
         utils::parse_middleware_options(&mut matches, device, /*loopback=*/ false);
     let name = &matches.free[0];
+    let query_type = parse_query_type(matches.opt_str("type").as_deref().unwrap_or("A"));
 
     // Create interface
     let mut config = match device.capabilities().medium {
@@ -66,7 +108,7 @@ fn main() {
 
     let socket = sockets.get_mut::<dns::Socket>(dns_handle);
     let query = socket
-        .start_query(iface.context(), name, DnsQueryType::A)
+        .start_query(iface.context(), name, query_type)
         .unwrap();
 
     loop {
@@ -79,8 +121,11 @@ fn main() {
             .get_mut::<dns::Socket>(dns_handle)
             .get_query_result(query)
         {
-            Ok(addrs) => {
-                println!("Query done: {addrs:?}");
+            Ok(results) => {
+                println!("Query done:");
+                for result in &results {
+                    println!("  {}", format_result(result));
+                }
                 break;
             }
             Err(GetQueryResultError::Pending) => {} // not done yet

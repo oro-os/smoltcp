@@ -43,6 +43,7 @@ enum_with_unknown! {
         Cname = 0x0005,
         Soa   = 0x0006,
         Aaaa  = 0x001c,
+        Srv   = 0x0021,
     }
 }
 
@@ -334,6 +335,41 @@ pub struct Record<'a> {
     pub data: RecordData<'a>,
 }
 
+#[cfg(feature = "proto-dns-srv")]
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SrvRecord<Target> {
+    pub priority: u16,
+    pub weight: u16,
+    pub port: u16,
+    pub target: Target,
+}
+
+#[cfg(feature = "proto-dns-srv")]
+impl<'a> SrvRecord<&'a [u8]> {
+    pub fn parse(data: &'a [u8]) -> Result<SrvRecord<&'a [u8]>> {
+        if data.len() < 6 {
+            return Err(Error);
+        }
+
+        let priority = NetworkEndian::read_u16(&data[0..2]);
+        let weight = NetworkEndian::read_u16(&data[2..4]);
+        let port = NetworkEndian::read_u16(&data[4..6]);
+        let target = &data[6..];
+        let (rest, _) = parse_name_part(target, |_| ())?;
+        if !rest.is_empty() {
+            return Err(Error);
+        }
+
+        Ok(SrvRecord {
+            priority,
+            weight,
+            port,
+            target,
+        })
+    }
+}
+
 impl<'a> RecordData<'a> {
     pub fn parse(type_: Type, data: &'a [u8]) -> Result<RecordData<'a>> {
         match type_ {
@@ -346,6 +382,8 @@ impl<'a> RecordData<'a> {
                 data.try_into().map_err(|_| Error)?,
             ))),
             Type::Cname => Ok(RecordData::Cname(data)),
+            #[cfg(feature = "proto-dns-srv")]
+            Type::Srv => Ok(RecordData::Srv(SrvRecord::parse(data)?)),
             x => Ok(RecordData::Other(x, data)),
         }
     }
@@ -359,6 +397,8 @@ pub enum RecordData<'a> {
     #[cfg(feature = "proto-ipv6")]
     Aaaa(Ipv6Address),
     Cname(&'a [u8]),
+    #[cfg(feature = "proto-dns-srv")]
+    Srv(SrvRecord<&'a [u8]>),
     Other(Type, &'a [u8]),
 }
 
@@ -721,6 +761,59 @@ mod test {
         assert_eq!(
             p.answers[1].data,
             RecordData::A(Ipv4Address::new(0x1f, 0x0d, 0x53, 0x24))
+        );
+    }
+
+    #[cfg(feature = "proto-dns-srv")]
+    #[test]
+    fn test_parse_response_srv() {
+        let bytes = &[
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x5f,
+            0x73, 0x69, 0x70, 0x04, 0x5f, 0x74, 0x63, 0x70, 0x07, 0x65, 0x78, 0x61, 0x6d, 0x70,
+            0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x00, 0x21, 0x00, 0x01, 0xc0, 0x0c, 0x00,
+            0x21, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x12, 0x00, 0x00, 0x00, 0x05, 0x13,
+            0xc4, 0x09, 0x73, 0x69, 0x70, 0x73, 0x65, 0x72, 0x76, 0x65, 0x72, 0xc0, 0x16,
+        ];
+
+        let p = Parsed::parse(bytes).unwrap();
+
+        assert_eq!(p.packet.transaction_id(), 0x1234);
+        assert_eq!(
+            p.packet.flags(),
+            Flags::RESPONSE | Flags::RECURSION_DESIRED | Flags::RECURSION_AVAILABLE
+        );
+        assert_eq!(p.packet.opcode(), Opcode::Query);
+        assert_eq!(p.packet.rcode(), Rcode::NoError);
+        assert_eq!(p.packet.question_count(), 1);
+        assert_eq!(p.packet.answer_record_count(), 1);
+
+        assert_eq!(p.questions[0].type_, Type::Srv);
+        assert_eq!(p.answers[0].name, &[0xc0, 0x0c]);
+        assert_eq!(p.answers[0].ttl, 60);
+        assert_eq!(
+            p.answers[0].data,
+            RecordData::Srv(SrvRecord {
+                priority: 0,
+                weight: 5,
+                port: 5060,
+                target: &[
+                    0x09, 0x73, 0x69, 0x70, 0x73, 0x65, 0x72, 0x76, 0x65, 0x72, 0xc0, 0x16
+                ],
+            })
+        );
+
+        let mut target_labels = Vec::new();
+        match &p.answers[0].data {
+            RecordData::Srv(srv) => p
+                .packet
+                .parse_name(srv.target)
+                .try_for_each(|label| label.map(|label| target_labels.push(label)))
+                .unwrap(),
+            other => panic!("unexpected answer data: {other:?}"),
+        }
+        assert_eq!(
+            target_labels,
+            vec![&b"sipserver"[..], &b"example"[..], &b"com"[..]]
         );
     }
 

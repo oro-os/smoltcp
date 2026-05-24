@@ -2,12 +2,16 @@ use core::cmp::min;
 #[cfg(feature = "async")]
 use core::task::Waker;
 
+#[cfg(feature = "proto-dns-srv")]
+use heapless::String;
 use heapless::Vec;
 use managed::ManagedSlice;
 
 use crate::config::{DNS_MAX_NAME_SIZE, DNS_MAX_RESULT_COUNT, DNS_MAX_SERVER_COUNT};
 use crate::socket::{Context, PollAt};
 use crate::time::{Duration, Instant};
+#[cfg(feature = "proto-dns-srv")]
+use crate::wire::dns::SrvRecord as WireSrvRecord;
 use crate::wire::dns::{Flags, Opcode, Packet, Question, Rcode, Record, RecordData, Repr, Type};
 use crate::wire::{self, IpAddress, IpProtocol, IpRepr, UdpRepr};
 
@@ -60,6 +64,8 @@ pub enum GetQueryResultError {
     Pending,
     /// Query failed.
     Failed,
+    /// SRV target exceeded the supported textual name length.
+    SrvTargetTooLong,
 }
 
 impl core::fmt::Display for GetQueryResultError {
@@ -67,6 +73,7 @@ impl core::fmt::Display for GetQueryResultError {
         match self {
             GetQueryResultError::Pending => write!(f, "Query is not done yet"),
             GetQueryResultError::Failed => write!(f, "Query failed"),
+            GetQueryResultError::SrvTargetTooLong => write!(f, "SRV target too long"),
         }
     }
 }
@@ -99,7 +106,7 @@ impl DnsQuery {
 enum State {
     Pending(PendingQuery),
     Completed(CompletedQuery),
-    Failure,
+    Failure(GetQueryResultError),
 }
 
 #[derive(Debug)]
@@ -127,7 +134,21 @@ pub enum MulticastDns {
 
 #[derive(Debug)]
 struct CompletedQuery {
-    addresses: Vec<IpAddress, DNS_MAX_RESULT_COUNT>,
+    results: Vec<QueryResult, DNS_MAX_RESULT_COUNT>,
+}
+
+#[cfg(feature = "proto-dns-srv")]
+/// An SRV answer returned by [`Socket::get_query_result`].
+pub type SrvQueryResult = WireSrvRecord<String<253>>;
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[cfg_attr(feature = "proto-dns-srv", expect(clippy::large_enum_variant))]
+/// A DNS answer returned by [`Socket::get_query_result`].
+pub enum QueryResult {
+    Address(IpAddress),
+    #[cfg(feature = "proto-dns-srv")]
+    Srv(SrvQueryResult),
 }
 
 /// A handle to an in-progress DNS query.
@@ -320,7 +341,7 @@ impl<'a> Socket<'a> {
     pub fn get_query_result(
         &mut self,
         handle: QueryHandle,
-    ) -> Result<Vec<IpAddress, DNS_MAX_RESULT_COUNT>, GetQueryResultError> {
+    ) -> Result<Vec<QueryResult, DNS_MAX_RESULT_COUNT>, GetQueryResultError> {
         let slot = &mut self.queries[handle.0];
         let q = slot.as_mut().unwrap();
         match &mut q.state {
@@ -328,13 +349,14 @@ impl<'a> Socket<'a> {
             State::Pending(_) => Err(GetQueryResultError::Pending),
             // Query is done
             State::Completed(q) => {
-                let res = q.addresses.clone();
+                let res = q.results.clone();
                 *slot = None; // Free up the slot for recycling.
                 Ok(res)
             }
-            State::Failure => {
+            State::Failure(error) => {
+                let error = *error;
                 *slot = None; // Free up the slot for recycling.
-                Err(GetQueryResultError::Failed)
+                Err(error)
             }
         }
     }
@@ -426,7 +448,7 @@ impl<'a> Socket<'a> {
 
                 if p.rcode() == Rcode::NXDomain {
                     net_trace!("rcode NXDomain");
-                    q.set_state(State::Failure);
+                    q.set_state(State::Failure(GetQueryResultError::Failed));
                     continue;
                 }
 
@@ -456,7 +478,7 @@ impl<'a> Socket<'a> {
                     }
                 }
 
-                let mut addresses = Vec::new();
+                let mut results = Vec::new();
 
                 for _ in 0..p.answer_record_count() {
                     let (payload2, r) = match Record::parse(payload) {
@@ -484,15 +506,70 @@ impl<'a> Socket<'a> {
                         #[cfg(feature = "proto-ipv4")]
                         RecordData::A(addr) => {
                             net_trace!("A: {:?}", addr);
-                            if addresses.push(addr.into()).is_err() {
-                                net_trace!("too many addresses in response, ignoring {:?}", addr);
+                            if results.push(QueryResult::Address(addr.into())).is_err() {
+                                net_trace!("too many results in response, ignoring {:?}", addr);
                             }
                         }
                         #[cfg(feature = "proto-ipv6")]
                         RecordData::Aaaa(addr) => {
                             net_trace!("AAAA: {:?}", addr);
-                            if addresses.push(addr.into()).is_err() {
-                                net_trace!("too many addresses in response, ignoring {:?}", addr);
+                            if results.push(QueryResult::Address(addr.into())).is_err() {
+                                net_trace!("too many results in response, ignoring {:?}", addr);
+                            }
+                        }
+                        #[cfg(feature = "proto-dns-srv")]
+                        RecordData::Srv(srv) => {
+                            net_trace!("SRV: {:?}", srv);
+
+                            let mut target = String::new();
+                            let mut first = true;
+                            for label in p.parse_name(srv.target) {
+                                let label = match label {
+                                    Ok(label) => label,
+                                    Err(_) => {
+                                        net_trace!("dns answer srv target malformed");
+                                        q.set_state(State::Failure(GetQueryResultError::Failed));
+                                        return;
+                                    }
+                                };
+
+                                let label = match core::str::from_utf8(label) {
+                                    Ok(label) => label,
+                                    Err(_) => {
+                                        net_trace!("dns answer srv target malformed");
+                                        q.set_state(State::Failure(GetQueryResultError::Failed));
+                                        return;
+                                    }
+                                };
+
+                                if !first && target.push('.').is_err() {
+                                    net_trace!("dns answer srv target too long");
+                                    q.set_state(State::Failure(
+                                        GetQueryResultError::SrvTargetTooLong,
+                                    ));
+                                    return;
+                                }
+
+                                if target.push_str(label).is_err() {
+                                    net_trace!("dns answer srv target too long");
+                                    q.set_state(State::Failure(
+                                        GetQueryResultError::SrvTargetTooLong,
+                                    ));
+                                    return;
+                                }
+
+                                first = false;
+                            }
+
+                            let result = QueryResult::Srv(SrvQueryResult {
+                                priority: srv.priority,
+                                weight: srv.weight,
+                                port: srv.port,
+                                target,
+                            });
+
+                            if results.push(result).is_err() {
+                                net_trace!("too many results in response, ignoring {:?}", srv);
                             }
                         }
                         RecordData::Cname(name) => {
@@ -516,10 +593,10 @@ impl<'a> Socket<'a> {
                     }
                 }
 
-                q.set_state(if addresses.is_empty() {
-                    State::Failure
+                q.set_state(if results.is_empty() {
+                    State::Failure(GetQueryResultError::Failed)
                 } else {
-                    State::Completed(CompletedQuery { addresses })
+                    State::Completed(CompletedQuery { results })
                 });
 
                 // If we get here, packet matched the current query, stop processing.
@@ -574,14 +651,14 @@ impl<'a> Socket<'a> {
                 // Check if we've run out of servers to try.
                 if pq.server_idx >= servers.len() {
                     net_trace!("already tried all servers.");
-                    q.set_state(State::Failure);
+                    q.set_state(State::Failure(GetQueryResultError::Failed));
                     continue;
                 }
 
                 // Check so the IP address is valid
                 if servers[pq.server_idx].is_unspecified() {
                     net_trace!("invalid unspecified DNS server addr.");
-                    q.set_state(State::Failure);
+                    q.set_state(State::Failure(GetQueryResultError::Failed));
                     continue;
                 }
 
@@ -620,7 +697,7 @@ impl<'a> Socket<'a> {
                     Some(src_addr) => src_addr,
                     None => {
                         net_trace!("no source address for destination {}", dst_addr);
-                        q.set_state(State::Failure);
+                        q.set_state(State::Failure(GetQueryResultError::Failed));
                         continue;
                     }
                 };
@@ -660,7 +737,7 @@ impl<'a> Socket<'a> {
             .filter_map(|q| match &q.state {
                 State::Pending(pq) => Some(PollAt::Time(pq.retransmit_at)),
                 State::Completed(_) => None,
-                State::Failure => None,
+                State::Failure(_) => None,
             })
             .min()
             .unwrap_or(PollAt::Ingress)
@@ -710,4 +787,207 @@ fn copy_name<'a, const N: usize>(
     dest.push(0).map_err(|_| wire::Error)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use std::vec::Vec as StdVec;
+
+    use super::*;
+    use crate::phy::Medium;
+    use crate::tests::setup;
+
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "proto-ipv4")] {
+            use crate::wire::Ipv4Address as IpvXAddress;
+
+            const LOCAL_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 1, 1);
+            const SERVER_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 1, 53);
+
+            const ADDRESS_QUERY_NAME: &str = "example.com";
+            const ADDRESS_QUERY_TYPE: Type = Type::A;
+
+            fn address_answer() -> StdVec<u8> {
+                vec![
+                    0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 1,
+                    2, 3, 4,
+                ]
+            }
+
+            fn expected_address_result() -> QueryResult {
+                QueryResult::Address(IpvXAddress::new(1, 2, 3, 4).into())
+            }
+        } else {
+            use crate::wire::Ipv6Address as IpvXAddress;
+
+            const LOCAL_ADDR: IpvXAddress = IpvXAddress::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+            const SERVER_ADDR: IpvXAddress = IpvXAddress::new(0xfe80, 0, 0, 0, 0, 0, 0, 53);
+
+            const ADDRESS_QUERY_NAME: &str = "example.com";
+            const ADDRESS_QUERY_TYPE: Type = Type::Aaaa;
+
+            fn address_answer() -> StdVec<u8> {
+                vec![
+                    0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x10,
+                    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ]
+            }
+
+            fn expected_address_result() -> QueryResult {
+                QueryResult::Address(IpvXAddress::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1).into())
+            }
+        }
+    }
+
+    fn test_medium() -> Medium {
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "medium-ip")] {
+                Medium::Ip
+            } else if #[cfg(feature = "medium-ethernet")] {
+                Medium::Ethernet
+            } else if #[cfg(feature = "medium-ieee802154")] {
+                Medium::Ieee802154
+            } else {
+                unreachable!()
+            }
+        }
+    }
+
+    fn dispatch_query(socket: &mut Socket<'_>, cx: &mut Context) -> (u16, StdVec<u8>) {
+        let mut emitted = None;
+
+        assert_eq!(
+            socket.dispatch(cx, |_, (_, udp_repr, payload)| {
+                emitted = Some((udp_repr.src_port, payload.to_vec()));
+                Ok::<_, ()>(())
+            }),
+            Ok(())
+        );
+
+        emitted.expect("DNS query should have been emitted")
+    }
+
+    fn build_response(query_payload: &[u8], answer: &[u8]) -> StdVec<u8> {
+        let query = Packet::new_checked(query_payload).unwrap();
+        let question = query.payload();
+
+        let mut response = vec![0; 12 + question.len() + answer.len()];
+        let mut packet = Packet::new_unchecked(response.as_mut_slice());
+        packet.set_transaction_id(query.transaction_id());
+        packet.set_flags(Flags::RESPONSE | Flags::RECURSION_DESIRED | Flags::RECURSION_AVAILABLE);
+        packet.set_opcode(query.opcode());
+        packet.set_question_count(1);
+        packet.set_answer_record_count(1);
+        packet.set_authority_record_count(0);
+        packet.set_additional_record_count(0);
+
+        let payload = packet.payload_mut();
+        payload[..question.len()].copy_from_slice(question);
+        payload[question.len()..].copy_from_slice(answer);
+
+        response
+    }
+
+    fn process_response(socket: &mut Socket<'_>, cx: &mut Context, dst_port: u16, payload: &[u8]) {
+        let udp_repr = UdpRepr {
+            src_port: DNS_PORT,
+            dst_port,
+        };
+        let ip_repr = IpRepr::new(
+            SERVER_ADDR.into(),
+            LOCAL_ADDR.into(),
+            IpProtocol::Udp,
+            udp_repr.header_len() + payload.len(),
+            64,
+        );
+
+        socket.process(cx, &ip_repr, &udp_repr, payload);
+    }
+
+    #[test]
+    fn test_get_query_result_address() {
+        let (mut iface, _, _) = setup(test_medium());
+        let cx = iface.context();
+        let mut socket = Socket::new(&[SERVER_ADDR.into()], vec![None]);
+
+        let handle = socket
+            .start_query(cx, ADDRESS_QUERY_NAME, ADDRESS_QUERY_TYPE)
+            .unwrap();
+        let (query_port, query_payload) = dispatch_query(&mut socket, cx);
+
+        let response = build_response(&query_payload, &address_answer());
+        process_response(&mut socket, cx, query_port, &response);
+
+        let expected = Vec::from_slice(&[expected_address_result()]).unwrap();
+        assert_eq!(socket.get_query_result(handle), Ok(expected));
+    }
+
+    #[cfg(feature = "proto-dns-srv")]
+    #[test]
+    fn test_get_query_result_srv() {
+        let (mut iface, _, _) = setup(test_medium());
+        let cx = iface.context();
+        let mut socket = Socket::new(&[SERVER_ADDR.into()], vec![None]);
+
+        let handle = socket
+            .start_query(cx, "_sip._tcp.example.com", Type::Srv)
+            .unwrap();
+        let (query_port, query_payload) = dispatch_query(&mut socket, cx);
+
+        let response = build_response(
+            &query_payload,
+            &[
+                0xc0, 0x0c, 0x00, 0x21, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x12, 0x00, 0x00,
+                0x00, 0x05, 0x13, 0xc4, 0x09, 0x73, 0x69, 0x70, 0x73, 0x65, 0x72, 0x76, 0x65, 0x72,
+                0xc0, 0x16,
+            ],
+        );
+        process_response(&mut socket, cx, query_port, &response);
+
+        let mut expected_target = String::new();
+        expected_target.push_str("sipserver.example.com").unwrap();
+        let expected = Vec::from_slice(&[QueryResult::Srv(SrvQueryResult {
+            priority: 0,
+            weight: 5,
+            port: 5060,
+            target: expected_target,
+        })])
+        .unwrap();
+        assert_eq!(socket.get_query_result(handle), Ok(expected));
+    }
+
+    #[cfg(feature = "proto-dns-srv")]
+    #[test]
+    fn test_get_query_result_srv_too_long() {
+        let (mut iface, _, _) = setup(test_medium());
+        let cx = iface.context();
+        let mut socket = Socket::new(&[SERVER_ADDR.into()], vec![None]);
+
+        let handle = socket
+            .start_query(cx, "_sip._tcp.example.com", Type::Srv)
+            .unwrap();
+        let (query_port, query_payload) = dispatch_query(&mut socket, cx);
+
+        let mut answer = vec![
+            0xc0, 0x0c, 0x00, 0x21, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x05, 0x13, 0xc4,
+        ];
+        for _ in 0..5 {
+            answer.push(0x3f);
+            answer.extend_from_slice(&[b'a'; 63]);
+        }
+        answer.push(0x00);
+
+        let rdlen = (answer.len() - 12) as u16;
+        answer[10] = (rdlen >> 8) as u8;
+        answer[11] = rdlen as u8;
+
+        let response = build_response(&query_payload, &answer);
+        process_response(&mut socket, cx, query_port, &response);
+
+        assert_eq!(
+            socket.get_query_result(handle),
+            Err(GetQueryResultError::SrvTargetTooLong)
+        );
+    }
 }

@@ -290,6 +290,9 @@ pub use self::dns::{
     Type as DnsQueryType,
 };
 
+#[cfg(all(feature = "proto-dns", feature = "proto-dns-srv"))]
+pub use self::dns::SrvRecord as DnsSrvRecord;
+
 #[cfg(feature = "proto-ipsec-ah")]
 pub use self::ipsec_ah::{Packet as IpSecAuthHeaderPacket, Repr as IpSecAuthHeaderRepr};
 
